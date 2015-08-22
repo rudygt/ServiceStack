@@ -581,72 +581,33 @@ namespace ServiceStack.Host
         {
             return (req, dtos) => 
             {
-                var dtosList = ((IEnumerable) dtos).Map(x => x);
+                List<object> dtosList = ((IEnumerable) dtos).Map(x => x);
                 var ret = new object[dtosList.Count];
                 if (ret.Length == 0)
                     return ret;
 
-                var firstDto = dtosList[0];
-
-                var firstResponse = handlerFn(req, firstDto);
-                if (firstResponse is Exception)
+                for (int i = 0; i < dtosList.Count; i++)
                 {
-                    req.SetAutoBatchCompletedHeader(0);
-                    return firstResponse;
-                }
+                    object dto = dtosList[i];
+                    object response = handlerFn(req, dto);
 
-                var asyncResponse = firstResponse as Task;
-
-                //sync
-                if (asyncResponse == null) 
-                {
-                    ret[0] = firstResponse; //don't re-execute first request
-                    for (var i = 1; i < dtosList.Count; i++)
+                    if (response is Task)
                     {
-                        var dto = dtosList[i];
-                        var response = handlerFn(req, dto);
-                        //short-circuit on first error
-                        if (response is Exception)
-                        {
-                            req.SetAutoBatchCompletedHeader(i);
-                            return response;
-                        }
-
-                        ret[i] = response;
+                        var responseTask = response as Task;
+                        response = responseTask.GetResult();
                     }
-                    req.SetAutoBatchCompletedHeader(dtosList.Count);
-                    return ret;
-                }
 
-                //async
-                var asyncResponses = new Task[dtosList.Count];
-                Task firstAsyncError = null;
-
-                //execute each async service sequentially
-                return dtosList.EachAsync((dto, i) =>
-                {
-                    //short-circuit on first error and don't exec any more handlers
-                    if (firstAsyncError != null)
-                        return firstAsyncError;
-
-                    asyncResponses[i] = i == 0
-                        ? asyncResponse //don't re-execute first request
-                        : (Task) handlerFn(req, dto);
-
-                    if (asyncResponses[i].GetResult() is Exception)
+                    //short-circuit on first error
+                    if (response is Exception)
                     {
                         req.SetAutoBatchCompletedHeader(i);
-                        return firstAsyncError = asyncResponses[i];
+                        return response;
                     }
-                    return asyncResponses[i];
-                })
-                .ContinueWith(x => {
-                    if (firstAsyncError != null)
-                        return (object)firstAsyncError;
 
-                    req.SetAutoBatchCompletedHeader(dtosList.Count);
-                    return (object) asyncResponses;
-                }); //return error or completed responses
+                    ret[i] = response;
+                }
+                req.SetAutoBatchCompletedHeader(dtosList.Count);
+                return ret;                
             };
         }
 
