@@ -1,9 +1,11 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Funq;
 using ServiceStack.Configuration;
@@ -576,7 +578,7 @@ namespace ServiceStack.Host
 
             return handlerFn;
         }
-
+        
         private static ServiceExecFn CreateAutoBatchServiceExec(ServiceExecFn handlerFn)
         {
             return (req, dtos) => 
@@ -586,67 +588,52 @@ namespace ServiceStack.Host
                 if (ret.Length == 0)
                     return ret;
 
-                var firstDto = dtosList[0];
+                // "Sequential" or "Parallel", defaults to Sequential (current behavior)
+                var executionMode = req.GetHeader("X-AutoBatch-Execution-Mode");
 
-                var firstResponse = handlerFn(req, firstDto);
-                if (firstResponse is Exception)
+                bool executeInParallel = executionMode != null && executionMode.EqualsIgnoreCase("Parallel");
+
+                if (executeInParallel)
                 {
-                    req.SetAutoBatchCompletedHeader(0);
-                    return firstResponse;
-                }
-
-                var asyncResponse = firstResponse as Task;
-
-                //sync
-                if (asyncResponse == null) 
-                {
-                    ret[0] = firstResponse; //don't re-execute first request
-                    for (var i = 1; i < dtosList.Count; i++)
+                    Parallel.For(0, dtosList.Count, new ParallelOptions() { MaxDegreeOfParallelism = Environment.ProcessorCount }, i =>
                     {
-                        var dto = dtosList[i];
-                        var response = handlerFn(req, dto);
-                        //short-circuit on first error
-                        if (response is Exception)
+                        object dto = dtosList[i];
+                        
+                        object response = handlerFn(req, dto);
+                        if (response is Task)
                         {
-                            req.SetAutoBatchCompletedHeader(i);
-                            return response;
+                            var responseTask = response as Task;
+                            response = responseTask.GetResult();
                         }
+                        ret[i] = response;                        
+                    });
 
-                        ret[i] = response;
-                    }
-                    req.SetAutoBatchCompletedHeader(dtosList.Count);
-                    return ret;
+                    return ret;                    
                 }
 
-                //async
-                var asyncResponses = new Task[dtosList.Count];
-                Task firstAsyncError = null;
-
-                //execute each async service sequentially
-                return dtosList.EachAsync((dto, i) =>
+                // sequential
+                for (int i = 0; i < dtosList.Count; i++)
                 {
-                    //short-circuit on first error and don't exec any more handlers
-                    if (firstAsyncError != null)
-                        return firstAsyncError;
-
-                    asyncResponses[i] = i == 0
-                        ? asyncResponse //don't re-execute first request
-                        : (Task) handlerFn(req, dto);
-
-                    if (asyncResponses[i].GetResult() is Exception)
+                    object dto = dtosList[i];
+                    object response = handlerFn(req, dto);
+                    if (response is Task)
+                    {
+                        var responseTask = response as Task;
+                        response = responseTask.GetResult();
+                    }
+                    //short-circuit on first error
+                    if (response is Exception)
                     {
                         req.SetAutoBatchCompletedHeader(i);
-                        return firstAsyncError = asyncResponses[i];
+                        return response;
                     }
-                    return asyncResponses[i];
-                })
-                .ContinueWith(x => {
-                    if (firstAsyncError != null)
-                        return (object)firstAsyncError;
 
-                    req.SetAutoBatchCompletedHeader(dtosList.Count);
-                    return (object) asyncResponses;
-                }); //return error or completed responses
+                    ret[i] = response;
+                }
+
+                req.SetAutoBatchCompletedHeader(dtosList.Count);
+
+                return ret;                                
             };
         }
 
